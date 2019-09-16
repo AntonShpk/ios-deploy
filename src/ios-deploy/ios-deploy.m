@@ -71,6 +71,9 @@ NSString* LLDB_FRUITSTRAP_MODULE = @
 const char* output_path = NULL;
 const char* error_path = NULL;
 
+typedef void (*iter_callback) (struct afc_connection *, char const *, char *);
+void remove_path_recursively_conn(struct afc_connection *conn, char const *path);
+
 typedef struct am_device * AMDeviceRef;
 mach_error_t AMDeviceSecureStartService(AMDeviceRef device, CFStringRef service_name, unsigned int *unknown, ServiceConnRef * handle);
 mach_error_t AMDeviceCreateHouseArrestService(AMDeviceRef device, CFStringRef identifier, void * unknown, AFCConnectionRef * handle);
@@ -392,13 +395,13 @@ CFStringRef get_device_full_name(const AMDeviceRef device) {
 NSDictionary* get_device_json_dict(const AMDeviceRef device) {
     NSMutableDictionary *json_dict = [NSMutableDictionary new];
     AMDeviceConnect(device);
-    
+
     CFStringRef device_udid = AMDeviceCopyDeviceIdentifier(device);
     if (device_udid) {
         [json_dict setValue:(__bridge NSString *)device_udid forKey:@"DeviceIdentifier"];
         CFRelease(device_udid);
     }
-    
+
     CFStringRef device_hardware_model = AMDeviceCopyValue(device, 0, CFSTR("HardwareModel"));
     if (device_hardware_model) {
         [json_dict setValue:(NSString*)device_hardware_model forKey:@"HardwareModel"];
@@ -414,7 +417,7 @@ NSDictionary* get_device_json_dict(const AMDeviceRef device) {
         }
         CFRelease(device_hardware_model);
     }
-    
+
     for (NSString *deviceValue in @[@"DeviceName",
                                     @"BuildVersion",
                                     @"DeviceClass",
@@ -426,7 +429,7 @@ NSDictionary* get_device_json_dict(const AMDeviceRef device) {
             CFRelease(cf_value);
         }
     }
-    
+
     AMDeviceDisconnect(device);
 
     return json_dict;
@@ -570,7 +573,7 @@ void mount_developer_image(AMDeviceRef device) {
                         @"Code": @(result),
                         @"Status": description});
         }
-        
+
         on_error(@"Unable to mount developer disk image. (%x)", result);
     }
 
@@ -1351,7 +1354,7 @@ int app_exists(AMDeviceRef device)
 
 void get_battery_level(AMDeviceRef device)
 {
-    
+
     AMDeviceConnect(device);
     assert(AMDeviceIsPaired(device));
     check_error(AMDeviceValidatePairing(device));
@@ -1360,7 +1363,7 @@ void get_battery_level(AMDeviceRef device)
     CFStringRef result = AMDeviceCopyValue(device, (void*)@"com.apple.mobile.battery", (__bridge CFStringRef)@"BatteryCurrentCapacity");
     NSLogOut(@"BatteryCurrentCapacity:%@",result);
     CFRelease(result);
-    
+
     check_error(AMDeviceStopSession(device));
     check_error(AMDeviceDisconnect(device));
 }
@@ -1567,6 +1570,66 @@ void remove_path(AMDeviceRef device) {
     check_error(AFCConnectionClose(afc_conn_p));
 }
 
+void iter_dir(struct afc_connection *conn, char const *path, iter_callback callback) {
+    struct afc_directory *dir;
+    char *dirent;
+
+    if(AFCDirectoryOpen(conn, path, &dir))
+        return;
+
+    while(1) {
+        assert(AFCDirectoryRead(conn, dir, &dirent) == 0);
+
+        if (!dirent)
+            break;
+
+        if (strcmp(dirent, ".") == 0 || strcmp(dirent, "..") == 0)
+            continue;
+
+        callback(conn, path, dirent);
+    }
+}
+
+void remove_path_callback(struct afc_connection *conn, char const *path, char *dirent) {
+    char subdir[255];
+    snprintf(subdir, 255, "%s/%s", path, dirent);
+    remove_path_recursively_conn(conn, subdir);
+}
+
+void remove_path_recursively_conn(struct afc_connection *conn, char const *path) {
+    int ret = AFCRemovePath(conn, path);
+    if(ret == 0 || ret == 8) {
+        // Successfully removed (it was empty) or does not exist
+        NSLogVerbose(@"Deleted %s", path);
+        return;
+    }
+
+    iter_dir(conn, path, (iter_callback) remove_path_callback);
+    ret = AFCRemovePath(conn, path);
+
+    if (ret == 10)
+    {
+        // No permissions for deleting folder
+        NSLogVerbose(@"No permissions for delete %s", path);
+        return;
+    }
+    assert(ret == 0);
+
+    NSLogVerbose(@"Deleted %s", path);
+}
+
+void remove_path_recursively(AMDeviceRef device) {
+    service_conn_t houseFd = start_house_arrest_service(device);
+
+    afc_connection afc_conn;
+    afc_connection* afc_conn_p = &afc_conn;
+    AFCConnectionOpen(houseFd, 0, &afc_conn_p);
+
+    remove_path_recursively_conn(afc_conn_p, target_filename);
+
+    assert(AFCConnectionClose(afc_conn_p) == 0);
+}
+
 void uninstall_app(AMDeviceRef device) {
     CFRetain(device); // don't know if this is necessary?
 
@@ -1646,6 +1709,8 @@ void handle_device(AMDeviceRef device) {
             make_directory(device);
         } else if (strcmp("rm", command) == 0) {
             remove_path(device);
+        } else if (strcmp("rm_r", command) == 0) {
+            remove_path_recursively(device);
         } else if (strcmp("exists", command) == 0) {
             exit(app_exists(device));
         } else if (strcmp("uninstall_only", command) == 0) {
@@ -1846,6 +1911,7 @@ void usage(const char* app) {
         @"  -2, --to <target pathname>   use together with up/download file/tree. specify target\n"
         @"  -D, --mkdir <dir>            make directory on device\n"
         @"  -R, --rm <path>              remove file or directory on device (directories must be empty)\n"
+        @"  -T, --rm_r <path>            remove file or directory recursively on device\n"
         @"  -V, --version                print the executable version \n"
         @"  -e, --exists                 check if the app with given bundle_id is installed or not \n"
         @"  -B, --list_bundle_id         list bundle_id \n"
@@ -1898,6 +1964,7 @@ int main(int argc, char *argv[]) {
         { "to", required_argument, NULL, '2'},
         { "mkdir", required_argument, NULL, 'D'},
         { "rm", required_argument, NULL, 'R'},
+        { "rm_r", required_argument, NULL, 'T'},
         { "exists", no_argument, NULL, 'e'},
         { "list_bundle_id", no_argument, NULL, 'B'},
         { "no-wifi", no_argument, NULL, 'W'},
@@ -1910,7 +1977,7 @@ int main(int argc, char *argv[]) {
     };
     int ch;
 
-    while ((ch = getopt_long(argc, argv, "VmcdvunrILeD:R:i:b:a:t:p:1:2:o:l:w:9BWjNs:OE:C", longopts, NULL)) != -1)
+    while ((ch = getopt_long(argc, argv, "VmcdvunrILeD:R:T:i:b:a:t:p:1:2:o:l:w:9BWjNs:OE:C", longopts, NULL)) != -1)
     {
         switch (ch) {
         case 'm':
@@ -1949,6 +2016,7 @@ int main(int argc, char *argv[]) {
             debug = true;
             break;
         case 'I':
+            install = 0;
             interactive = false;
             debug = true;
             break;
@@ -2005,6 +2073,11 @@ int main(int argc, char *argv[]) {
             target_filename = optarg;
             command = "rm";
             break;
+        case 'T':
+            command_only = true;
+            target_filename = optarg;
+            command = "rm_r";
+            break;
         case 'e':
             command_only = true;
             command = "exists";
@@ -2037,7 +2110,7 @@ int main(int argc, char *argv[]) {
             return exitcode_error;
         }
     }
-    
+
     if (debugserver_only && (args || envs)) {
         usage(argv[0]);
         on_error(@"The --args and --envs options can not be combined with --nolldb.");
