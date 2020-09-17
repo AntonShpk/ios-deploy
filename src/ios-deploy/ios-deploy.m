@@ -2369,6 +2369,7 @@ int main(int argc, char *argv[]) {
             debug = true;
             break;
         case 'I':
+            install = 0;
             interactive = false;
             debug = true;
             break;
